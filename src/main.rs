@@ -18,7 +18,7 @@ fn calc_crc(data: &[u8]) -> u16 {
 }
 
 fn main() {
-    let api = HidApi::new().expect("Failed to init HID API");
+    let mut api = HidApi::new().expect("Failed to init HID API");
     let mut devices: HashMap<usize, HidDevice> = HashMap::new();
     let mut global_last_val = 0;
 
@@ -37,51 +37,69 @@ fn main() {
     b_pkt[62] = (b_crc >> 8) as u8;
     b_pkt[63] = (b_crc & 0xFF) as u8;
 
-    for device_info in api.device_list() {
-        let iface = device_info.interface_number();
-        // Добавлена проверка только для интерфейсов 4 и 7
-        if device_info.vendor_id() == VID && (iface == 4 || iface == 7) {
-            if let Ok(dev) = device_info.open_device(&api) {
-                let id = devices.len();
-                let _ = dev.write(&h_pkt);
-                std::thread::sleep(Duration::from_millis(50));
-                let _ = dev.write(&b_pkt);
-                devices.insert(id, dev);
+    loop {
+        // Если список устройств пуст, пытаемся их найти
+        if devices.is_empty() {
+            let _ = api.refresh_devices(); // Обновляем список доступных HID устройств
+            for device_info in api.device_list() {
+                let iface = device_info.interface_number();
+                if device_info.vendor_id() == VID && (iface == 4 || iface == 7) {
+                    if let Ok(dev) = device_info.open_device(&api) {
+                        let id = devices.len();
+                        let _ = dev.write(&h_pkt);
+                        std::thread::sleep(Duration::from_millis(50));
+                        let _ = dev.write(&b_pkt);
+                        devices.insert(id, dev);
+                    }
+                }
+            }
+
+            if devices.is_empty() {
+                // Если всё еще пусто, ждем 5 секунд и пробуем снова, чтобы не грузить процессор
+                std::thread::sleep(Duration::from_secs(5));
+                continue;
             }
         }
-    }
 
-    if devices.is_empty() {
-        return;
-    }
-
-    let mut buf = [0u8; 64];
-    loop {
         let mut received_any = false;
-        for dev in devices.values() {
-            if let Ok(res) = dev.read_timeout(&mut buf, 10) {
-                if res >= 3 && buf[0] == 0x04 && buf[1] == 0x03 {
-                    let val = buf[2];
-                    if val > 0 && val <= 100 && val != global_last_val {
-                        let output = WaybarOutput {
-                            text: format!("{}%", val),
-                            tooltip: format!("Attack Shark R5\nЗаряд: {}%", val),
-                            class: if val < 20 {
-                                "critical".into()
-                            } else {
-                                "normal".into()
-                            },
-                            percentage: val,
-                        };
-                        println!("{}", serde_json::to_string(&output).unwrap());
-                        global_last_val = val;
+        let mut to_remove = Vec::new();
+
+        for (&id, dev) in devices.iter() {
+            let mut buf = [0u8; 64];
+            match dev.read_timeout(&mut buf, 10) {
+                Ok(res) => {
+                    if res >= 3 && buf[0] == 0x04 && buf[1] == 0x03 {
+                        let val = buf[2];
+                        if val > 0 && val <= 100 && val != global_last_val {
+                            let output = WaybarOutput {
+                                text: format!("{}%", val),
+                                tooltip: format!("Attack Shark R5\nЗаряд: {}%", val),
+                                class: if val < 20 {
+                                    "critical".into()
+                                } else {
+                                    "normal".into()
+                                },
+                                percentage: val,
+                            };
+                            println!("{}", serde_json::to_string(&output).unwrap());
+                            global_last_val = val;
+                        }
+                        received_any = true;
                     }
-                    received_any = true;
+                }
+                Err(_) => {
+                    // Если устройство отвалилось (выключили), помечаем на удаление
+                    to_remove.push(id);
                 }
             }
         }
 
-        if !received_any {
+        // Чистим список, если устройства отключились
+        for id in to_remove {
+            devices.remove(&id);
+        }
+
+        if !received_any && !devices.is_empty() {
             for dev in devices.values() {
                 let _ = dev.write(&b_pkt);
             }
