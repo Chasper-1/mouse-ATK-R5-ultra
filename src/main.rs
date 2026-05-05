@@ -38,7 +38,9 @@ fn main() {
     b_pkt[63] = (b_crc & 0xFF) as u8;
 
     for device_info in api.device_list() {
-        if device_info.vendor_id() == VID && device_info.interface_number() != 0 {
+        let iface = device_info.interface_number();
+        // Добавлена проверка только для интерфейсов 4 и 7
+        if device_info.vendor_id() == VID && (iface == 4 || iface == 7) {
             if let Ok(dev) = device_info.open_device(&api) {
                 let id = devices.len();
                 let _ = dev.write(&h_pkt);
