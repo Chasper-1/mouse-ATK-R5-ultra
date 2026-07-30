@@ -71,8 +71,10 @@ fn main() {
                             let output = WaybarOutput {
                                 text: format!("{}%", val),
                                 tooltip: format!("Attack Shark R5\nЗаряд: {}%", val),
-                                class: if val < 20 {
+                                class: if val < 5 {
                                     "critical".into()
+                                } else if val <= 20 {
+                                    "low".into()
                                 } else {
                                     "normal".into()
                                 },
