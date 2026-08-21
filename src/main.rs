@@ -1,12 +1,10 @@
 use hidapi::{HidApi, HidDevice};
 use serde::Serialize;
-use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 const VID: u16 = 0x373E;
 const ATTEMPTS: usize = 10;
 const RETRY_DELAY: Duration = Duration::from_millis(500);
-const CACHE_FILE: &str = "attack-shark-r5-battery";
 
 #[derive(Serialize)]
 struct WaybarOutput {
@@ -50,24 +48,6 @@ fn battery_class(val: u8) -> Option<&'static str> {
     }
 }
 
-fn cache_path() -> Option<PathBuf> {
-    let dir = std::env::var("XDG_CACHE_HOME")
-        .map(PathBuf::from)
-        .or_else(|_| std::env::var("HOME").map(|h| Path::new(&h).join(".cache")))
-        .ok()?;
-    Some(dir.join(CACHE_FILE))
-}
-
-fn read_cache(path: &Path) -> Option<u8> {
-    std::fs::read_to_string(path)
-        .ok()
-        .and_then(|s| s.trim().parse().ok())
-}
-
-fn write_cache(path: &Path, val: u8) -> std::io::Result<()> {
-    std::fs::write(path, val.to_string())
-}
-
 fn main() {
     let mut api = HidApi::new().expect("HID API init");
 
@@ -89,35 +69,14 @@ fn main() {
         std::thread::sleep(RETRY_DELAY);
     }
 
-    let out = match battery {
-        Some(val) => {
-            if let Some(path) = cache_path() {
-                let _ = write_cache(&path, val);
-            }
-            WaybarOutput {
-                text: format!("{}%", val),
-                tooltip: format!("Attack Shark R5\nЗаряд: {}%", val),
-                class: battery_class(val).map(String::from),
-                percentage: val,
-            }
-        }
-        None => {
-            let cached = cache_path().and_then(|p| read_cache(&p));
-            match cached {
-                Some(val) => WaybarOutput {
-                    text: format!("{}%", val),
-                    tooltip: "Attack Shark R5\nНет ответа (данные устарели)".into(),
-                    class: Some("off".into()),
-                    percentage: val,
-                },
-                None => WaybarOutput {
-                    text: "?%".into(),
-                    tooltip: "Attack Shark R5\nНет ответа".into(),
-                    class: Some("off".into()),
-                    percentage: 0,
-                },
-            }
-        }
+    let Some(val) = battery else {
+        return; // мышь не ответила — ничего не выводим
+    };
+    let out = WaybarOutput {
+        text: format!("{}%", val),
+        tooltip: format!("Attack Shark R5\nЗаряд: {}%", val),
+        class: battery_class(val).map(String::from),
+        percentage: val,
     };
     println!("{}", serde_json::to_string(&out).unwrap());
 }
@@ -133,24 +92,5 @@ mod tests {
         assert_eq!(battery_class(20), Some("low"));
         assert_eq!(battery_class(21), None);
         assert_eq!(battery_class(100), None);
-    }
-
-    #[test]
-    fn cache_roundtrip() {
-        let path =
-            std::env::temp_dir().join(format!("mouse-cache-test-{}.tmp", std::process::id()));
-        assert_eq!(read_cache(&path), None);
-        write_cache(&path, 54).unwrap();
-        assert_eq!(read_cache(&path), Some(54));
-        std::fs::remove_file(&path).unwrap();
-    }
-
-    #[test]
-    fn cache_garbage_is_none() {
-        let path =
-            std::env::temp_dir().join(format!("mouse-cache-garbage-{}.tmp", std::process::id()));
-        std::fs::write(&path, "abc\n").unwrap();
-        assert_eq!(read_cache(&path), None);
-        std::fs::remove_file(&path).unwrap();
     }
 }
