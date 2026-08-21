@@ -1,108 +1,156 @@
 use hidapi::{HidApi, HidDevice};
 use serde::Serialize;
-use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 const VID: u16 = 0x373E;
+const ATTEMPTS: usize = 10;
+const RETRY_DELAY: Duration = Duration::from_millis(500);
+const CACHE_FILE: &str = "attack-shark-r5-battery";
 
 #[derive(Serialize)]
 struct WaybarOutput {
     text: String,
     tooltip: String,
-    class: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    class: Option<String>,
     percentage: u8,
 }
 
-fn calc_crc(data: &[u8]) -> u16 {
-    data.iter().take(62).map(|&b| b as u16).sum()
+/// Порт JS getBatPer(): feature-запрос батареи.
+/// Новый протокол: resp[2]=0xA1, resp[5]=2, resp[7]=131 -> процент в resp[9].
+/// Старый протокол: всё сдвинуто на байт влево -> процент в resp[8].
+fn get_battery(dev: &HidDevice) -> Option<u8> {
+    let mut req = [0u8; 65];
+    req[3] = 2; // deviceId: мышь
+    req[4] = 2; // группа "параметры"
+    req[6] = 131; // 0x83 = запрос батареи
+    dev.send_feature_report(&req).ok()?;
+    std::thread::sleep(Duration::from_millis(100));
+    let mut resp = [0u8; 65];
+    resp[0] = 0;
+    dev.get_feature_report(&mut resp).ok()?;
+    if resp[2] == 0xA1 && resp[5] == 2 && resp[7] == 131 {
+        return Some(resp[9]);
+    }
+    if resp[1] == 0xA1 && resp[4] == 2 && resp[6] == 131 {
+        return Some(resp[8]);
+    }
+    None
+}
+
+/// Класс для waybar по уровню заряда. Обычный режим — класса нет.
+fn battery_class(val: u8) -> Option<&'static str> {
+    if val < 5 {
+        Some("critical")
+    } else if val <= 20 {
+        Some("low")
+    } else {
+        None
+    }
+}
+
+fn cache_path() -> Option<PathBuf> {
+    let dir = std::env::var("XDG_CACHE_HOME")
+        .map(PathBuf::from)
+        .or_else(|_| std::env::var("HOME").map(|h| Path::new(&h).join(".cache")))
+        .ok()?;
+    Some(dir.join(CACHE_FILE))
+}
+
+fn read_cache(path: &Path) -> Option<u8> {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+}
+
+fn write_cache(path: &Path, val: u8) -> std::io::Result<()> {
+    std::fs::write(path, val.to_string())
 }
 
 fn main() {
-    let mut api = HidApi::new().expect("Failed to init HID API");
-    // Храним по path (строка), чтобы не путать устройства при переподключении
-    let mut devices: HashMap<String, HidDevice> = HashMap::new();
-    let mut global_last_val = 0;
+    let mut api = HidApi::new().expect("HID API init");
 
-    let mut h_pkt = [0u8; 64];
-    h_pkt[0] = 0x08;
-    h_pkt[1] = 0x01;
-    let h_crc = calc_crc(&h_pkt);
-    h_pkt[62] = (h_crc >> 8) as u8;
-    h_pkt[63] = (h_crc & 0xFF) as u8;
-
-    let mut b_pkt = [0u8; 64];
-    b_pkt[0] = 0x08;
-    b_pkt[1] = 0x02;
-    b_pkt[2] = 0x02;
-    let b_crc = calc_crc(&b_pkt);
-    b_pkt[62] = (b_crc >> 8) as u8;
-    b_pkt[63] = (b_crc & 0xFF) as u8;
-
-    let mut buf = [0u8; 64];
-
-    loop {
-        // 1. Обновляем список портов (как твой питон сканирует hidraw)
+    // До ATTEMPTS попыток достучаться до мыши
+    let mut battery = None;
+    'outer: for _ in 0..ATTEMPTS {
         let _ = api.refresh_devices();
-        for device_info in api.device_list() {
-            if device_info.vendor_id() == VID && device_info.interface_number() != 0 {
-                let path = device_info.path().to_string_lossy().into_owned();
-
-                if !devices.contains_key(&path) {
-                    if let Ok(dev) = device_info.open_device(&api) {
-                        let _ = dev.write(&h_pkt);
-                        std::thread::sleep(Duration::from_millis(50));
-                        let _ = dev.write(&b_pkt);
-                        devices.insert(path, dev);
-                    }
-                }
+        for info in api.device_list() {
+            if info.vendor_id() != VID {
+                continue;
+            }
+            if let Ok(dev) = info.open_device(&api)
+                && let Some(pct) = get_battery(&dev)
+            {
+                battery = Some(pct);
+                break 'outer;
             }
         }
+        std::thread::sleep(RETRY_DELAY);
+    }
 
-        let mut received_any = false;
-        let mut to_remove = Vec::new();
-
-        // 2. Опрашиваем все открытые порты (твой цикл по values)
-        for (path, dev) in devices.iter() {
-            match dev.read_timeout(&mut buf, 10) {
-                Ok(res) if res >= 3 && buf[0] == 0x04 && buf[1] == 0x03 => {
-                    let val = buf[2];
-                    if val > 0 && val <= 100 {
-                        if val != global_last_val {
-                            let output = WaybarOutput {
-                                text: format!("{}%", val),
-                                tooltip: format!("Attack Shark R5\nЗаряд: {}%", val),
-                                class: if val < 5 {
-                                    "critical".into()
-                                } else if val <= 20 {
-                                    "low".into()
-                                } else {
-                                    "normal".into()
-                                },
-                                percentage: val,
-                            };
-                            println!("{}", serde_json::to_string(&output).unwrap());
-                            global_last_val = val;
-                        }
-                        received_any = true;
-                    }
-                }
-                // Если ошибка чтения (устройство выткнули) — помечаем на удаление
-                Err(_) => to_remove.push(path.clone()),
-                _ => {}
+    let out = match battery {
+        Some(val) => {
+            if let Some(path) = cache_path() {
+                let _ = write_cache(&path, val);
+            }
+            WaybarOutput {
+                text: format!("{}%", val),
+                tooltip: format!("Attack Shark R5\nЗаряд: {}%", val),
+                class: battery_class(val).map(String::from),
+                percentage: val,
             }
         }
-
-        // Чистим мертвые дескрипторы
-        for path in to_remove {
-            devices.remove(&path);
-        }
-
-        // 3. Если никто не ответил — пинаем всех и ждем секунду
-        if !received_any {
-            for dev in devices.values() {
-                let _ = dev.write(&b_pkt);
+        None => {
+            let cached = cache_path().and_then(|p| read_cache(&p));
+            match cached {
+                Some(val) => WaybarOutput {
+                    text: format!("{}%", val),
+                    tooltip: "Attack Shark R5\nНет ответа (данные устарели)".into(),
+                    class: Some("off".into()),
+                    percentage: val,
+                },
+                None => WaybarOutput {
+                    text: "?%".into(),
+                    tooltip: "Attack Shark R5\nНет ответа".into(),
+                    class: Some("off".into()),
+                    percentage: 0,
+                },
             }
-            std::thread::sleep(Duration::from_secs(1));
         }
+    };
+    println!("{}", serde_json::to_string(&out).unwrap());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn battery_class_boundaries() {
+        assert_eq!(battery_class(4), Some("critical"));
+        assert_eq!(battery_class(5), Some("low"));
+        assert_eq!(battery_class(20), Some("low"));
+        assert_eq!(battery_class(21), None);
+        assert_eq!(battery_class(100), None);
+    }
+
+    #[test]
+    fn cache_roundtrip() {
+        let path =
+            std::env::temp_dir().join(format!("mouse-cache-test-{}.tmp", std::process::id()));
+        assert_eq!(read_cache(&path), None);
+        write_cache(&path, 54).unwrap();
+        assert_eq!(read_cache(&path), Some(54));
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn cache_garbage_is_none() {
+        let path =
+            std::env::temp_dir().join(format!("mouse-cache-garbage-{}.tmp", std::process::id()));
+        std::fs::write(&path, "abc\n").unwrap();
+        assert_eq!(read_cache(&path), None);
+        std::fs::remove_file(&path).unwrap();
     }
 }
