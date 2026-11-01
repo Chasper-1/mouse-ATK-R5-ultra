@@ -2,6 +2,7 @@
 name = "mouse"
 version = "0.5.1"
 edition = "2024"
+description = "Mouse configuration for ATK R5 Ultra — DPI and button mapping"
 
 [dependencies]
 hidapi = "2.6.5"
