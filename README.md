@@ -55,7 +55,7 @@ sudo ./uninstall.sh
 
 ```json
 "custom/mouse": {
-    "format": "󰍽 {}",
+    "format": "󰍽 {}",              // Символ мыши, без шрифта nerd fonts символ не работает. Тут символ не видно
     "exec": "~/.local/bin/mouse",
     "interval": 10,
     "return-type": "json",
