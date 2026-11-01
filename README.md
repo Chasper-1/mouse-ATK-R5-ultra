@@ -88,4 +88,3 @@ cargo test
 
 1. Проверь, что правило применилось: `getfacl /dev/hidraw*`.
 2. Проверь, что ядро видит мышь с VID `373e`: `cat /sys/class/hidraw/hidraw*/device/uevent`.
-3. По проводу донгл может использовать другой протокол: рабочий вариант в `src/main.rs`, экспериментальный с CRC — в `src/new.rs`.
